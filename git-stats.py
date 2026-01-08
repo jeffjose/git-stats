@@ -83,6 +83,7 @@ def main():
     parser = argparse.ArgumentParser(description="Unified GitHub Behavior Analytics")
     parser.add_argument("--years", type=str, default="2020,2021,2022,2023,2024,2025", help="Comma separated years to analyze")
     parser.add_argument("--mode", choices=["all", "monthly", "language", "repos", "temporal", "births"], default="all", help="Analysis mode")
+    parser.add_argument("--save", action="store_true", help="Save raw data to CSV files")
     args = parser.parse_args()
 
     years = [int(y.strip()) for y in args.years.split(",")]
@@ -137,7 +138,7 @@ def main():
                     "repo": name,
                     "language": l["node"]["name"],
                     "commits_weighted": total_commits * weight,
-                    "loc_approx": (l["size"] / 50) # Very rough heuristic: 50 bytes per line per language
+                    "loc_approx": (l["size"] / 50)
                 })
 
     if not all_data:
@@ -146,6 +147,10 @@ def main():
 
     df = pd.DataFrame(all_data)
     
+    if args.save:
+        df.to_csv("github_raw_stats.csv", index=False)
+        print("\n[INFO] Raw data saved to github_raw_stats.csv")
+
     # Monthly View
     if args.mode in ["all", "monthly"]:
         activity_df = df[df["type"] == "activity"].copy()
