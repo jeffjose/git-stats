@@ -23,7 +23,7 @@ def run_gh_api(query):
     return json.loads(result.stdout)
 
 def fetch_stats(year):
-    """Fetches contribution and repository-specific language stats for a given year."""
+    """Fetches contribution, repository, and temporal stats for a given year."""
     start = f"{year}-01-01T00:00:00Z"
     end = f"{year}-12-31T23:59:59Z"
     
@@ -36,6 +36,7 @@ def fetch_stats(year):
             repository {{
               nameWithOwner
               isPrivate
+              createdAt
               languages(first: 10, orderBy: {{field: SIZE, direction: DESC}}) {{
                 edges {{
                   size
@@ -43,8 +44,11 @@ def fetch_stats(year):
                 }}
               }}
             }}
-            contributions {{
-              totalCount
+            contributions(first: 100) {{
+              nodes {{
+                occurredAt
+                commitCount
+              }}
             }}
           }}
           contributionCalendar {{
@@ -78,11 +82,12 @@ def print_ascii_chart(data, title):
 def main():
     parser = argparse.ArgumentParser(description="Unified GitHub Behavior Analytics")
     parser.add_argument("--years", type=str, default="2020,2021,2022,2023,2024,2025", help="Comma separated years to analyze")
-    parser.add_argument("--mode", choices=["all", "monthly", "language", "repos"], default="all", help="Analysis mode")
+    parser.add_argument("--mode", choices=["all", "monthly", "language", "repos", "temporal", "births"], default="all", help="Analysis mode")
     args = parser.parse_args()
 
     years = [int(y.strip()) for y in args.years.split(",")]
     all_data = []
+    repo_creation_dates = {}
     
     for year in years:
         print(f"Fetching data for {year}...", file=sys.stderr)
@@ -91,7 +96,7 @@ def main():
         
         coll = raw["data"]["viewer"]["contributionsCollection"]
         
-        # 1. Daily Activity (Contribution Calendar)
+        # 1. Daily Activity
         calendar = coll["contributionCalendar"]
         for week in calendar["weeks"]:
             for day in week["contributionDays"]:
@@ -102,10 +107,25 @@ def main():
                     "count": day["contributionCount"]
                 })
 
-        # 2. Repository and Weighted Language Data
+        # 2. Repo, Language, Temporal, and LOC data
         for entry in coll["commitContributionsByRepository"]:
             repo = entry["repository"]
-            commits = entry["contributions"]["totalCount"]
+            name = repo["nameWithOwner"]
+            repo_creation_dates[name] = repo["createdAt"]
+            
+            commits_nodes = entry["contributions"]["nodes"]
+            total_commits = sum(c["commitCount"] for c in commits_nodes)
+            
+            # Temporal - Hour of Day
+            for c_node in commits_nodes:
+                dt = datetime.strptime(c_node["occurredAt"], "%Y-%m-%dT%H:%M:%SZ")
+                all_data.append({
+                    "type": "temporal",
+                    "year": year,
+                    "hour": dt.hour,
+                    "weight": c_node["commitCount"]
+                })
+            
             langs = repo["languages"]["edges"]
             total_size = sum(l["size"] for l in langs)
             
@@ -114,11 +134,10 @@ def main():
                 all_data.append({
                     "type": "coding",
                     "year": year,
-                    "repo": repo["nameWithOwner"],
-                    "is_private": repo["isPrivate"],
+                    "repo": name,
                     "language": l["node"]["name"],
-                    "commits_weighted": commits * weight,
-                    "bytes": l["size"]
+                    "commits_weighted": total_commits * weight,
+                    "loc_approx": (l["size"] / 50) # Very rough heuristic: 50 bytes per line per language
                 })
 
     if not all_data:
@@ -132,30 +151,34 @@ def main():
         activity_df = df[df["type"] == "activity"].copy()
         activity_df["month"] = pd.to_datetime(activity_df["date"]).dt.to_period("M")
         monthly_totals = activity_df.groupby("month")["count"].sum()
-        print_ascii_chart(monthly_totals, "Monthly Activity Trend (Total Contributions)")
+        print_ascii_chart(monthly_totals, "Monthly Activity Trend")
+
+    # Temporal View
+    if args.mode in ["all", "temporal"]:
+        temporal_df = df[df["type"] == "temporal"]
+        hour_dist = temporal_df.groupby("hour")["weight"].sum()
+        print_ascii_chart(hour_dist, "Activity by Hour of Day (UTC)")
+
+    # Repo Births View
+    if args.mode in ["all", "births"]:
+        births = pd.Series(repo_creation_dates).apply(lambda x: datetime.strptime(x, "%Y-%m-%dT%H:%M:%SZ").year)
+        births_count = births.value_counts().sort_index()
+        print_ascii_chart(births_count, "Repository Birth Rate (New Repos per Year)")
 
     # Language View
     if args.mode in ["all", "language"]:
         coding_df = df[df["type"] == "coding"]
         lang_trend = coding_df.groupby(["year", "language"])["commits_weighted"].sum().unstack(fill_value=0)
         top_langs = lang_trend.sum().sort_values(ascending=False).index[:10]
-        
-        print(f"\n=== Language Trend (Weighted Commits) ===")
+        print("\n=== Language Trend (Weighted Commits) ===")
         print(lang_trend[top_langs].round(1))
-        
-        if len(years) >= 2:
-            start_yr, end_yr = min(years), max(years)
-            print(f"\nGrowth Analysis: {start_yr} vs {end_yr}")
-            if start_yr in lang_trend.index and end_yr in lang_trend.index:
-                growth = (lang_trend.loc[end_yr] / (lang_trend.loc[start_yr] + 0.1)) # Small epsilon
-                print(growth[top_langs].sort_values(ascending=False).round(2))
 
-    # Repo View
+    # Repos and LOC View
     if args.mode in ["all", "repos"]:
         coding_df = df[df["type"] == "coding"]
-        print(f"\n=== Top 10 Repositories (Total Years) ===")
-        top_repos = coding_df.groupby("repo")["commits_weighted"].sum().sort_values(ascending=False).head(10)
-        print_ascii_chart(top_repos, "Top Repositories by Commit Volume")
+        repo_stats = coding_df.groupby("repo").agg({"commits_weighted": "sum", "loc_approx": "sum"}).sort_values("commits_weighted", ascending=False).head(10)
+        print("\n=== Top Repositories (Commits & Approx LOC) ===")
+        print(repo_stats.round(0))
 
 if __name__ == "__main__":
     main()
